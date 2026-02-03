@@ -94,7 +94,5 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Use PORT environment variable if available (for Render/Heroku), else 8000
     port = int(os.environ.get("PORT", 8000))
-    # Host 0.0.0.0 is required for container/cloud environments to be accessible
     uvicorn.run(app, host="0.0.0.0", port=port)
