@@ -6,3 +6,5 @@ uvicorn
 python-multipart
 ultralytics
 opencv-python-headless
+onnx
+onnxruntime

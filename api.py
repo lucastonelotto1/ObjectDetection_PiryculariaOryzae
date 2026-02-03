@@ -10,19 +10,26 @@ app = FastAPI()
 
 # Load model globally to avoid reloading on every request
 # Assuming best.pt is in the same directory
-MODEL_PATH = "best.pt"
+# Prioritize ONNX model for performance/memory on Render
+ONNX_MODEL_PATH = "best.onnx"
+PT_MODEL_PATH = "best.pt"
 
 model = None
 
 @app.on_event("startup")
 async def startup_event():
     global model
-    if os.path.exists(MODEL_PATH):
-        print(f"Loading model from {MODEL_PATH}...")
-        model = YOLO(MODEL_PATH)
-        print("Model loaded successfully.")
+    if os.path.exists(ONNX_MODEL_PATH):
+        print(f"Loading ONNX model from {ONNX_MODEL_PATH}...")
+        model = YOLO(ONNX_MODEL_PATH, task='detect')
+        print("ONNX Model loaded successfully.")
+    elif os.path.exists(PT_MODEL_PATH):
+        print(f"Loading PT model from {PT_MODEL_PATH}...")
+        print("WARNING: Using PT model may cause OOM on free tier servers.")
+        model = YOLO(PT_MODEL_PATH)
+        print("PT Model loaded successfully.")
     else:
-        print(f"WARNING: {MODEL_PATH} not found in {os.getcwd()}")
+        print(f"WARNING: No model found in {os.getcwd()}")
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
