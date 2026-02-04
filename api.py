@@ -31,6 +31,10 @@ async def startup_event():
     else:
         print(f"WARNING: No model found in {os.getcwd()}")
 
+@app.get("/")
+def index():
+    return {"status": "Online", "model": "YOLOv8", "documentation": "/docs"}
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     if model is None:
