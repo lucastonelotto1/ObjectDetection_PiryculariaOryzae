@@ -1,16 +1,23 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from PIL import Image
 import io
 import uvicorn
 import os
 import cv2
+import numpy as np
 
 app = FastAPI()
 
-# Load model globally to avoid reloading on every request
-# Assuming best.pt is in the same directory
-# Prioritize ONNX model for performance/memory on Render
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 PT_MODEL_PATH = "best.pt"
 
 model = None
@@ -58,9 +65,6 @@ async def predict(files: list[UploadFile] = File(..., alias="file")):
     for file in files:
         # Validate file type (if provided)
         if file.content_type and not file.content_type.startswith("image/"):
-            # We can skip non-images or raise error. 
-            # For now, let's skip/continue or error. 
-            # Given the user context, raising error might be safer to avoid confusion.
              raise HTTPException(status_code=400, detail=f"File {file.filename} must be an image.")
 
         try:
@@ -77,18 +81,38 @@ async def predict(files: list[UploadFile] = File(..., alias="file")):
             
             annotated_image = None
 
-            for r in results:
-                # Generate annotated image (BGR -> RGB -> PIL -> Base64)
-                im_bgr = r.plot()
-                im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
-                annotated_image = Image.fromarray(im_rgb)
+            # Prepare image for drawing (PIL -> NumPy -> OpenCV BGR)
+            img_np = np.array(image)
+            # Handle if image is RGBA/L/etc.
+            if image.mode == 'RGBA':
+                img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+            elif image.mode == 'RGB':
+                img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            else:
+                 # Fallback/Hope it works or is grayscale
+                 if len(img_np.shape) == 2:
+                    img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+                 else:
+                    # Just assume RGB->BGR if 3 channels
+                    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
+            img_cv = img_np.copy() # Work on a copy
+
+            for r in results:
                 for box in r.boxes:
                     cls_id = int(box.cls[0])
                     conf = float(box.conf[0])
                     name = model.names[cls_id]
                     bbox = box.xyxy[0].tolist() 
+                    x1, y1, x2, y2 = map(int, bbox)
                     
+                    # Draw boxes with thicker black lines (User request)
+                    cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 0, 0), 4)
+                    
+                    label = f"{name} {conf:.2f}"
+                    # Larger black text (User request)
+                    cv2.putText(img_cv, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+
                     det = {
                         "class": name,
                         "confidence": round(conf, 4),
@@ -100,6 +124,9 @@ async def predict(files: list[UploadFile] = File(..., alias="file")):
                     if conf > max_conf_in_image:
                         max_conf_in_image = conf
                         best_detection_in_image = det
+            
+            # Convert back to PIL (BGR -> RGB)
+            annotated_image = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
             
             # Encode image to base64
             import base64
@@ -128,14 +155,8 @@ async def predict(files: list[UploadFile] = File(..., alias="file")):
                 best_response = response_payload
 
         except Exception as e:
-            # If one image fails, ideally we might want to continue or report partial error.
-            # But simpler to fail fast or just log and continue. 
-            # Let's log and continue to next image to allow partial success?
-            # Or fail strictly? The query asks for "predict", imply strict.
-            # However, traceback printing is in original code.
             import traceback
             traceback.print_exc()
-            # We will raise to be safe, or we could just skip this file.
             raise HTTPException(status_code=500, detail=f"Error processing {file.filename}: {str(e)}")
 
     # Return the best response found, or the default (first image) if no detections in any
