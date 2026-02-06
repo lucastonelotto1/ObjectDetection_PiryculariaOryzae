@@ -41,73 +41,105 @@ def index():
     return {"status": "Online", "model": "YOLOv8", "documentation": "/docs"}
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(files: list[UploadFile] = File(..., alias="file")):
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded. Check server logs.")
     
-    # Validate file type (if provided)
-    if file.content_type and not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image.")
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    try:
-        # Read image
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        
-        # Inference
-        results = model.predict(source=image, imgsz=640, conf=0.25, save=False)
-        
-        detections = []
-        best_detection = None
-        max_conf = -1.0
+    best_response = None
+    highest_confidence = -1.0
+    
+    # If no detections are found in any image, we'll want to return *something*.
+    # We can default to the result of the first video/image processed.
+    default_response = None
 
-        annotated_image = None
+    for file in files:
+        # Validate file type (if provided)
+        if file.content_type and not file.content_type.startswith("image/"):
+            # We can skip non-images or raise error. 
+            # For now, let's skip/continue or error. 
+            # Given the user context, raising error might be safer to avoid confusion.
+             raise HTTPException(status_code=400, detail=f"File {file.filename} must be an image.")
 
-        for r in results:
-            # Generate annotated image (BGR -> RGB -> PIL -> Base64)
-            im_bgr = r.plot()
-            im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
-            annotated_image = Image.fromarray(im_rgb)
+        try:
+            # Read image
+            contents = await file.read()
+            image = Image.open(io.BytesIO(contents))
+            
+            # Inference
+            results = model.predict(source=image, imgsz=640, conf=0.25, save=False)
+            
+            detections = []
+            best_detection_in_image = None
+            max_conf_in_image = -1.0
+            
+            annotated_image = None
 
-            for box in r.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                name = model.names[cls_id]
-                bbox = box.xyxy[0].tolist() 
-                
-                det = {
-                    "class": name,
-                    "confidence": round(conf, 4),
-                    "box": bbox
-                }
-                detections.append(det)
+            for r in results:
+                # Generate annotated image (BGR -> RGB -> PIL -> Base64)
+                im_bgr = r.plot()
+                im_rgb = cv2.cvtColor(im_bgr, cv2.COLOR_BGR2RGB)
+                annotated_image = Image.fromarray(im_rgb)
 
-                # Track best detection
-                if conf > max_conf:
-                    max_conf = conf
-                    best_detection = det
-        
-        # Encode image to base64
-        import base64
-        buffered = io.BytesIO()
-        if annotated_image:
-            annotated_image.save(buffered, format="JPEG")
-            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        else:
-            img_str = None
+                for box in r.boxes:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    name = model.names[cls_id]
+                    bbox = box.xyxy[0].tolist() 
+                    
+                    det = {
+                        "class": name,
+                        "confidence": round(conf, 4),
+                        "box": bbox
+                    }
+                    detections.append(det)
 
-        return {
-            "filename": file.filename, 
-            "count": len(detections),
-            "best_detection": best_detection,
-            "detections": detections,
-            "image_base64": img_str
-        }
+                    # Track best detection inside this image
+                    if conf > max_conf_in_image:
+                        max_conf_in_image = conf
+                        best_detection_in_image = det
+            
+            # Encode image to base64
+            import base64
+            buffered = io.BytesIO()
+            if annotated_image:
+                annotated_image.save(buffered, format="JPEG")
+                img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            else:
+                img_str = None
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+            response_payload = {
+                "filename": file.filename, 
+                "count": len(detections),
+                "best_detection": best_detection_in_image,
+                "detections": detections,
+                "image_base64": img_str
+            }
+
+            # If this is the first image processed, set it as default fallback
+            if default_response is None:
+                default_response = response_payload
+            
+            # Check if this image has a better detection than what we've seen so far
+            if max_conf_in_image > highest_confidence:
+                highest_confidence = max_conf_in_image
+                best_response = response_payload
+
+        except Exception as e:
+            # If one image fails, ideally we might want to continue or report partial error.
+            # But simpler to fail fast or just log and continue. 
+            # Let's log and continue to next image to allow partial success?
+            # Or fail strictly? The query asks for "predict", imply strict.
+            # However, traceback printing is in original code.
+            import traceback
+            traceback.print_exc()
+            # We will raise to be safe, or we could just skip this file.
+            raise HTTPException(status_code=500, detail=f"Error processing {file.filename}: {str(e)}")
+
+    # Return the best response found, or the default (first image) if no detections in any
+    return best_response if best_response else default_response
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
