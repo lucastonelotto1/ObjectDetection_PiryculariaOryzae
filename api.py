@@ -11,7 +11,6 @@ app = FastAPI()
 # Load model globally to avoid reloading on every request
 # Assuming best.pt is in the same directory
 # Prioritize ONNX model for performance/memory on Render
-ONNX_MODEL_PATH = "best.onnx"
 PT_MODEL_PATH = "best.pt"
 
 model = None
@@ -19,14 +18,20 @@ model = None
 @app.on_event("startup")
 async def startup_event():
     global model
-    if os.path.exists(ONNX_MODEL_PATH):
-        print(f"Loading ONNX model from {ONNX_MODEL_PATH}...")
-        model = YOLO(ONNX_MODEL_PATH, task='detect')
-        print("ONNX Model loaded successfully.")
-    elif os.path.exists(PT_MODEL_PATH):
+    if os.path.exists(PT_MODEL_PATH):
         print(f"Loading PT model from {PT_MODEL_PATH}...")
         print("WARNING: Using PT model may cause OOM on free tier servers.")
         model = YOLO(PT_MODEL_PATH)
+        # Explicitly set class names to ensure correct mapping
+        if hasattr(model, 'model') and hasattr(model.model, 'names'):
+            model.model.names[0] = 'no_pyr'
+            model.model.names[1] = 'pyr'
+        else:
+            # Fallback if structure is different (e.g. older versions/generic wrapper)
+            model.names[0] = 'no_pyr'
+            model.names[1] = 'pyr'
+
+        print(f"Model names set to: {model.names}")
         print("PT Model loaded successfully.")
     else:
         print(f"WARNING: No model found in {os.getcwd()}")
