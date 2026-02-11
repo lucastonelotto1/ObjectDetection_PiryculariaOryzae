@@ -30,6 +30,66 @@ def rotate_image(image: Image.Image, angle: float) -> Image.Image:
     """
     return image.rotate(angle, expand=True, fillcolor=(0, 0, 0))
 
+def rotate_point(point, angle, center_rot, center_orig):
+    """
+    Rotates a point back to the original image coordinates.
+    """
+    x, y = point
+    cx_rot, cy_rot = center_rot
+    cx_orig, cy_orig = center_orig
+    
+    # Convert angle to radians
+    rad = np.radians(angle)
+    cos_a = np.cos(rad)
+    sin_a = np.sin(rad)
+    
+    # Translate to center of rotated image
+    tx = x - cx_rot
+    ty = y - cy_rot
+    
+    # Rotate
+    rx = tx * cos_a - ty * sin_a
+    ry = tx * sin_a + ty * cos_a
+    
+    # Translate back to center of original image
+    final_x = rx + cx_orig
+    final_y = ry + cy_orig
+    
+    return final_x, final_y
+
+def rotate_bounding_box(bbox, angle, orig_size, rot_size):
+    """
+    Rotates a bounding box back to the original image coordinates.
+    """
+    x1, y1, x2, y2 = bbox
+    orig_w, orig_h = orig_size
+    rot_w, rot_h = rot_size
+    
+    center_rot = (rot_w / 2, rot_h / 2)
+    center_orig = (orig_w / 2, orig_h / 2)
+    
+    # Corners of the bounding box
+    corners = [
+        (x1, y1),
+        (x2, y1),
+        (x2, y2),
+        (x1, y2)
+    ]
+    
+    # Rotate corners
+    rotated_corners = [rotate_point(c, -angle, center_rot, center_orig) for c in corners]
+    
+    # Find new bounding box (AABB)
+    xs = [c[0] for c in rotated_corners]
+    ys = [c[1] for c in rotated_corners]
+    
+    min_x = max(0, min(xs))
+    max_x = min(orig_w, max(xs))
+    min_y = max(0, min(ys))
+    max_y = min(orig_h, max(ys))
+    
+    return [min_x, min_y, max_x, max_y]
+
 def process_detection_results(results, image: Image.Image, model) -> dict:
     """
     Processes YOLO results and returns a structured dictionary with detections and the annotated image.
@@ -174,6 +234,32 @@ async def predict_with_tta(model, image: Image.Image, filename: str):
         # Remove the PIL object before returning (not JSON serializable)
         if "annotated_image_obj" in best_overall_response:
             del best_overall_response["annotated_image_obj"]
+
+        # Rotate bounding boxes back to original coordinates
+        if best_angle != 0:
+             # We need the size of the ROTATED image before it was cropped (which is what detections are based on)
+             # But wait, `annotated_img` IS the rotated image (with detections drawn on it, but we have the raw detection data)
+             # Actually, `annotated_image_obj` in the response is the one with boxes drawn. 
+             # The detections in `best_overall_response["detections"]` are based on `rot_img` size.
+             # We need to recalculate `rot_img` size or store it. 
+             # However, since `annotated_image_obj` corresponds to `rot_img`, we can use its size.
+             # BUT `annotated_image_obj` has already been deleted from the dict a few lines up? No, we just deleted the key from dict, the var `annotated_img` still holds the object?
+             # Actually line 176 `del best_overall_response["annotated_image_obj"]` removes it from the dict.
+             # We assigned `annotated_img = best_overall_response["annotated_image_obj"]` on line 147. So `annotated_img` is safe.
+             
+             rot_w, rot_h = annotated_img.size
+             
+             # Update best_detection box
+             if best_overall_response.get("best_detection"):
+                 old_box = best_overall_response["best_detection"]["box"]
+                 new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
+                 best_overall_response["best_detection"]["box"] = new_box
+            
+             # Update all detections
+             for det in best_overall_response.get("detections", []):
+                 old_box = det["box"]
+                 new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
+                 det["box"] = new_box
 
     # Also clean default_response if it exists and we're returning it or if it shares reference
     if default_response and "annotated_image_obj" in default_response:
