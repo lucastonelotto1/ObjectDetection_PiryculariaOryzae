@@ -76,8 +76,10 @@ def rotate_bounding_box(bbox, angle, orig_size, rot_size):
         (x1, y2)
     ]
     
-    # Rotate corners
-    rotated_corners = [rotate_point(c, -angle, center_rot, center_orig) for c in corners]
+    # Rotate corners (map from rotated image back to original coordinates)
+    # PIL rotates counter-clockwise for positive angles; using the same sign here
+    # keeps the mapping consistent with how `rotate_image` was applied.
+    rotated_corners = [rotate_point(c, angle, center_rot, center_orig) for c in corners]
     
     # Find new bounding box (AABB)
     xs = [c[0] for c in rotated_corners]
@@ -97,22 +99,6 @@ def process_detection_results(results, image: Image.Image, model) -> dict:
     detections = []
     max_conf = -1.0
     best_detection = None
-    
-    # Prepare image for drawing (PIL -> NumPy -> OpenCV BGR)
-    img_np = np.array(image)
-    
-    # Check if image is grayscale (2 dimensions) or has 3 dimensions
-    if len(img_np.shape) == 2:
-        # Grayscale to BGR
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
-    elif img_np.shape[2] == 4:
-        # RGBA to BGR
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
-    elif img_np.shape[2] == 3:
-        # RGB to BGR
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    
-    img_cv = img_np.copy()
 
     for r in results:
         for box in r.boxes:
@@ -120,14 +106,6 @@ def process_detection_results(results, image: Image.Image, model) -> dict:
             conf = float(box.conf[0])
             name = model.names[cls_id]
             bbox = box.xyxy[0].tolist() 
-            x1, y1, x2, y2 = map(int, bbox)
-            
-            # Draw boxes with thicker black lines
-            cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 0, 0), 4)
-            
-            label = f"{name} {conf:.2f}"
-            # Larger black text
-            cv2.putText(img_cv, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
 
             det = {
                 "class": name,
@@ -139,23 +117,12 @@ def process_detection_results(results, image: Image.Image, model) -> dict:
             if conf > max_conf:
                 max_conf = conf
                 best_detection = det
-    
-    # Convert back to PIL (BGR -> RGB)
-    annotated_image = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-    
-    # Encode image to base64
-    import base64
-    buffered = io.BytesIO()
-    annotated_image.save(buffered, format="JPEG")
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
     return {
         "count": len(detections),
         "best_detection": best_detection,
         "max_conf": max_conf,
-        "detections": detections,
-        "image_base64": img_str,
-        "annotated_image_obj": annotated_image # Keep object if needed for further processing
+        "detections": detections
     }
 
 async def predict_with_tta(model, image: Image.Image, filename: str):
@@ -168,12 +135,13 @@ async def predict_with_tta(model, image: Image.Image, filename: str):
     # Default response (usually the 0-degree or first processed)
     default_response = None
 
-    # Capture original image size for later cropping
+    # Capture original image size (used to map boxes back)
     orig_w, orig_h = image.size
 
     for angle in ANGLES:
         # Rotate image
         rot_img = rotate_image(image, angle)
+        rot_w, rot_h = rot_img.size
         
         # Predict
         results = model.predict(source=rot_img, imgsz=640, conf=0.25, save=False)
@@ -187,8 +155,7 @@ async def predict_with_tta(model, image: Image.Image, filename: str):
             "count": processed["count"],
             "best_detection": processed["best_detection"],
             "detections": processed["detections"],
-            "image_base64": processed["image_base64"],
-            "annotated_image_obj": processed["annotated_image_obj"]
+            "rot_size": (rot_w, rot_h),
         }
 
         # Set default if it's the first angle (0 degrees usually)
@@ -200,70 +167,43 @@ async def predict_with_tta(model, image: Image.Image, filename: str):
             highest_overall_conf = processed["max_conf"]
             best_overall_response = response_payload
             
-    
-    # If we found a best response, we need to rotate the annotated image back to original orientation
+    # If we found a best response, rotate its boxes back to original coordinates
+    # and draw them aligned with the original (no-rotation) image.
     if best_overall_response:
         best_angle = best_overall_response["rotation_angle"]
-        annotated_img = best_overall_response["annotated_image_obj"]
-        
-        # Inverse rotation: rotate by -angle
-        # We use the same background color (black) or grey as requested? 
-        # User accepted black in previous turn diff. 
-        # Keep consistent with rotate_image function which now uses black (0,0,0) based on user manual edit.
-        final_img = annotated_img.rotate(-best_angle, expand=True, fillcolor=(0, 0, 0))
-        
-        # Center Crop to remove the massive black borders from expansion
-        # The image is now upright (conceptually) but on a large canvas.
-        # We want to crop the center to the original size.
-        curr_w, curr_h = final_img.size
-        left = (curr_w - orig_w) / 2
-        top = (curr_h - orig_h) / 2
-        right = (curr_w + orig_w) / 2
-        bottom = (curr_h + orig_h) / 2
-        
-        final_img = final_img.crop((left, top, right, bottom))
-        
-        # Update base64
+        rot_w, rot_h = best_overall_response.get("rot_size", (orig_w, orig_h))
+
+        # Rotate bounding boxes back to original coordinates
+        if best_angle != 0:
+            if best_overall_response.get("best_detection"):
+                old_box = best_overall_response["best_detection"]["box"]
+                new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
+                best_overall_response["best_detection"]["box"] = new_box
+
+            for det in best_overall_response.get("detections", []):
+                old_box = det["box"]
+                new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
+                det["box"] = new_box
+
+        # Draw boxes on a copy of the original image so they are not tilted
+        base_img = image.convert("RGB")
+        img_np = np.array(base_img)
+        # RGB to BGR for OpenCV
+        img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        for det in best_overall_response.get("detections", []):
+            x1, y1, x2, y2 = map(int, det["box"])
+            label = f"{det['class']} {det['confidence']:.2f}"
+            cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 0, 0), 4)
+            cv2.putText(img_cv, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+
+        # Convert back to PIL and encode to base64
+        final_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
         import base64
         buffered = io.BytesIO()
         final_img.save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        
         best_overall_response["image_base64"] = img_str
-        
-        # Remove the PIL object before returning (not JSON serializable)
-        if "annotated_image_obj" in best_overall_response:
-            del best_overall_response["annotated_image_obj"]
-
-        # Rotate bounding boxes back to original coordinates
-        if best_angle != 0:
-             # We need the size of the ROTATED image before it was cropped (which is what detections are based on)
-             # But wait, `annotated_img` IS the rotated image (with detections drawn on it, but we have the raw detection data)
-             # Actually, `annotated_image_obj` in the response is the one with boxes drawn. 
-             # The detections in `best_overall_response["detections"]` are based on `rot_img` size.
-             # We need to recalculate `rot_img` size or store it. 
-             # However, since `annotated_image_obj` corresponds to `rot_img`, we can use its size.
-             # BUT `annotated_image_obj` has already been deleted from the dict a few lines up? No, we just deleted the key from dict, the var `annotated_img` still holds the object?
-             # Actually line 176 `del best_overall_response["annotated_image_obj"]` removes it from the dict.
-             # We assigned `annotated_img = best_overall_response["annotated_image_obj"]` on line 147. So `annotated_img` is safe.
-             
-             rot_w, rot_h = annotated_img.size
-             
-             # Update best_detection box
-             if best_overall_response.get("best_detection"):
-                 old_box = best_overall_response["best_detection"]["box"]
-                 new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
-                 best_overall_response["best_detection"]["box"] = new_box
-            
-             # Update all detections
-             for det in best_overall_response.get("detections", []):
-                 old_box = det["box"]
-                 new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
-                 det["box"] = new_box
-
-    # Also clean default_response if it exists and we're returning it or if it shares reference
-    if default_response and "annotated_image_obj" in default_response:
-        del default_response["annotated_image_obj"]
 
     return best_overall_response if best_overall_response and highest_overall_conf > -1.0 else default_response
 
