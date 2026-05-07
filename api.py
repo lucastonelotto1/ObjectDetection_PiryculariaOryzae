@@ -32,14 +32,16 @@ def rotate_image(image: Image.Image, angle: float) -> Image.Image:
 
 def rotate_point(point, angle, center_rot, center_orig):
     """
-    Rotates a point back to the original image coordinates.
+    Maps a point from the rotated image back to the original image coordinates.
+    PIL rotates counter-clockwise for positive angles, so the inverse rotation
+    uses the NEGATED angle.
     """
     x, y = point
     cx_rot, cy_rot = center_rot
     cx_orig, cy_orig = center_orig
     
-    # Convert angle to radians
-    rad = np.radians(angle)
+    # Inverse rotation: negate the angle to undo what PIL did
+    rad = np.radians(-angle)
     cos_a = np.cos(rad)
     sin_a = np.sin(rad)
     
@@ -47,7 +49,7 @@ def rotate_point(point, angle, center_rot, center_orig):
     tx = x - cx_rot
     ty = y - cy_rot
     
-    # Rotate
+    # Apply inverse rotation
     rx = tx * cos_a - ty * sin_a
     ry = tx * sin_a + ty * cos_a
     
@@ -127,85 +129,69 @@ def process_detection_results(results, image: Image.Image, model) -> dict:
 
 async def predict_with_tta(model, image: Image.Image, filename: str):
     """
-    Performs Test Time Augmentation (TTA) by rotating the image and selecting the best prediction.
+    Performs TTA by trying all rotation angles. Picks the rotation with the
+    highest confidence, draws boxes on that rotated image, then rotates the
+    entire annotated image back to the original orientation — boxes stay
+    perfectly aligned without any coordinate math.
     """
-    best_overall_response = None
-    highest_overall_conf = -1.0
-    
-    # Default response (usually the 0-degree or first processed)
-    default_response = None
+    import base64
 
-    # Capture original image size (used to map boxes back)
+    # Save original dimensions to crop back after inverse rotation
     orig_w, orig_h = image.size
 
+    best_conf = -1.0
+    best_processed = None
+    best_rot_img = None
+    best_angle = 0
+
     for angle in ANGLES:
-        # Rotate image
         rot_img = rotate_image(image, angle)
-        rot_w, rot_h = rot_img.size
-        
-        # Predict
         results = model.predict(source=rot_img, imgsz=640, conf=0.25, save=False)
-        
-        # Process results
         processed = process_detection_results(results, rot_img, model)
-        
-        response_payload = {
-            "filename": filename,
-            "rotation_angle": angle,
-            "count": processed["count"],
-            "best_detection": processed["best_detection"],
-            "detections": processed["detections"],
-            "rot_size": (rot_w, rot_h),
-        }
 
-        # Set default if it's the first angle (0 degrees usually)
-        if default_response is None:
-            default_response = response_payload
+        if processed["max_conf"] > best_conf:
+            best_conf = processed["max_conf"]
+            best_processed = processed
+            best_rot_img = rot_img
+            best_angle = angle
 
-        # Check if this rotation yielded a better result
-        if processed["max_conf"] > highest_overall_conf:
-            highest_overall_conf = processed["max_conf"]
-            best_overall_response = response_payload
-            
-    # If we found a best response, rotate its boxes back to original coordinates
-    # and draw them aligned with the original (no-rotation) image.
-    if best_overall_response:
-        best_angle = best_overall_response["rotation_angle"]
-        rot_w, rot_h = best_overall_response.get("rot_size", (orig_w, orig_h))
+    # Draw boxes directly on the winning rotated image
+    base_img = best_rot_img.convert("RGB")
+    img_np = np.array(base_img)
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        # Rotate bounding boxes back to original coordinates
-        if best_angle != 0:
-            if best_overall_response.get("best_detection"):
-                old_box = best_overall_response["best_detection"]["box"]
-                new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
-                best_overall_response["best_detection"]["box"] = new_box
+    for det in best_processed["detections"]:
+        x1, y1, x2, y2 = map(int, det["box"])
+        label = f"{det['class']} {det['confidence']:.2f}"
+        cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 0, 0), 4)
+        cv2.putText(img_cv, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
 
-            for det in best_overall_response.get("detections", []):
-                old_box = det["box"]
-                new_box = rotate_bounding_box(old_box, best_angle, (orig_w, orig_h), (rot_w, rot_h))
-                det["box"] = new_box
+    # Rotate the whole annotated image back to original orientation.
+    # Since boxes are already painted as pixels, they rotate with the image
+    # and remain perfectly aligned — no coordinate transformation needed.
+    annotated_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+    if best_angle != 0:
+        annotated_img = annotated_img.rotate(-best_angle, expand=True, fillcolor=(0, 0, 0))
+        # Crop center back to original dimensions to remove black borders
+        w, h = annotated_img.size
+        left = (w - orig_w) // 2
+        top  = (h - orig_h) // 2
+        annotated_img = annotated_img.crop((left, top, left + orig_w, top + orig_h))
 
-        # Draw boxes on a copy of the original image so they are not tilted
-        base_img = image.convert("RGB")
-        img_np = np.array(base_img)
-        # RGB to BGR for OpenCV
-        img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    # Encode annotated image to base64
+    final_img = annotated_img
+    buffered = io.BytesIO()
+    final_img.save(buffered, format="JPEG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-        for det in best_overall_response.get("detections", []):
-            x1, y1, x2, y2 = map(int, det["box"])
-            label = f"{det['class']} {det['confidence']:.2f}"
-            cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 0, 0), 4)
-            cv2.putText(img_cv, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
-
-        # Convert back to PIL and encode to base64
-        final_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
-        import base64
-        buffered = io.BytesIO()
-        final_img.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        best_overall_response["image_base64"] = img_str
-
-    return best_overall_response if best_overall_response and highest_overall_conf > -1.0 else default_response
+    return {
+        "filename": filename,
+        "rotation_angle": best_angle,
+        "count": best_processed["count"],
+        "best_detection": best_processed["best_detection"],
+        "detections": best_processed["detections"],
+        "image_base64": img_str,
+    }
 
 @app.on_event("startup")
 async def startup_event():
@@ -256,6 +242,13 @@ async def predict(files: list[UploadFile] = File(..., alias="file")):
             # Read image
             contents = await file.read()
             image = Image.open(io.BytesIO(contents))
+            
+            # Apply EXIF orientation so phone/camera images aren't double-rotated
+            try:
+                from PIL import ImageOps
+                image = ImageOps.exif_transpose(image)
+            except Exception:
+                pass  # If EXIF data is missing or malformed, skip
             
             # Perform TTA prediction
             best_img_response = await predict_with_tta(model, image, file.filename)
